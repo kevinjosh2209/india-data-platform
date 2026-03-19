@@ -211,3 +211,6 @@ bronze_data/
 
 # Silver layer generated data
 silver_data/
+
+# Gold layer generated data
+gold_data/
