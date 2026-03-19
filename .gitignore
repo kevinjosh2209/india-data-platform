@@ -208,3 +208,6 @@ __marimo__/
 
 # Project generated data — never commit raw data files
 bronze_data/
+
+# Silver layer generated data
+silver_data/
