@@ -13,6 +13,7 @@ import urllib.request
 import urllib.error
 from datetime import datetime, date
 import os
+import boto3
 
 # ============================================================
 # LOGGING SETUP
@@ -136,32 +137,38 @@ def fetch_city_weather(city: dict) -> dict | None:
 
 def save_to_bronze(records: list, fetch_date: date) -> str:
     """
-    Saves fetched records as JSON file.
-    Folder structure mirrors S3 bronze layer:
-    bronze_data/weather/year=2024/month=01/day=15/data.json
-
-    This partitioning pattern is used in every real data lake.
-    It makes loading specific dates very fast.
+    Saves fetched records directly to S3 bronze layer.
+    No local file — goes straight to cloud.
+    This is the production pattern.
     """
-    # Build folder path with date partitions
-    folder_path = os.path.join(
-        BRONZE_FOLDER,
-        "weather",
-        f"year={fetch_date.year}",
-        f"month={fetch_date.month:02d}",
-        f"day={fetch_date.day:02d}"
+    # S3 key follows the same date partition pattern
+    s3_key = (
+        f"bronze/weather/"
+        f"year={fetch_date.year}/"
+        f"month={fetch_date.month:02d}/"
+        f"day={fetch_date.day:02d}/"
+        f"data.json"
     )
 
-    # Create folder if it doesn't exist
-    os.makedirs(folder_path, exist_ok=True)
+    # Convert records to JSON string
+    body = json.dumps(records, indent=2, ensure_ascii=False)
 
-    # Save as JSON
-    file_path = os.path.join(folder_path, "data.json")
+    # Upload directly to S3
+    s3_client = boto3.client("s3", region_name="ap-south-1")
+    s3_client.put_object(
+        Bucket   = "india-data-platform-111315405619",
+        Key      = s3_key,
+        Body     = body.encode("utf-8"),
+        ContentType = "application/json",
+        Metadata = {
+            "pipeline"    : "india-data-platform",
+            "ingested_at" : datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "record_count": str(len(records)),
+        }
+    )
 
-    with open(file_path, "w", encoding="utf-8") as f:
-        json.dump(records, f, indent=2, ensure_ascii=False)
-
-    return file_path
+    logger.info(f"Uploaded to S3: s3://india-data-platform-111315405619/{s3_key}")
+    return s3_key
 
 
 def run_ingestion() -> None:
