@@ -1,22 +1,19 @@
 # ============================================================
 # India Data Platform
 # File    : spark_jobs/bronze_to_silver.py
-# Purpose : Read raw bronze weather JSON, apply cleaning and
-#           validation, save as structured silver layer CSV.
-#           Fixes: null values, invalid ranges, date types,
-#           inconsistent city name capitalization.
+# Purpose : Read raw JSON from S3 bronze layer, clean and
+#           validate, write clean CSV to S3 silver layer.
+#           Fully cloud native — no local files needed.
 # Author  : Kevin Josh
 # ============================================================
 
 import json
 import csv
+import io
 import logging
-import os
+import boto3
 from datetime import datetime, date
-
-# ============================================================
-# LOGGING SETUP
-# ============================================================
+from botocore.exceptions import ClientError
 
 logging.basicConfig(
     level=logging.INFO,
@@ -25,118 +22,127 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-
 # ============================================================
 # CONFIGURATION
 # ============================================================
 
-# Input — bronze layer (raw JSON)
-BRONZE_FOLDER = "bronze_data"
-
-# Output — silver layer (clean CSV)
-SILVER_FOLDER = "silver_data"
-
-# Valid temperature range for India in Celsius
-TEMP_MIN = -5.0
-TEMP_MAX = 55.0
-
-# Valid humidity range
+S3_BUCKET    = "india-data-platform-111315405619"
+REGION       = "ap-south-1"
+TEMP_MIN     = -5.0
+TEMP_MAX     = 55.0
 HUMIDITY_MIN = 0.0
 HUMIDITY_MAX = 100.0
+
+s3_client = boto3.client("s3", region_name=REGION)
+
+
+# ============================================================
+# S3 READ / WRITE HELPERS
+# ============================================================
+
+def read_from_s3(s3_key: str) -> dict:
+    """
+    Reads a JSON file directly from S3.
+    No local download needed.
+    """
+    try:
+        logger.info(f"Reading from S3: s3://{S3_BUCKET}/{s3_key}")
+        response = s3_client.get_object(Bucket=S3_BUCKET, Key=s3_key)
+        content  = response["Body"].read().decode("utf-8")
+        return json.loads(content)
+    except ClientError as e:
+        error_code = e.response["Error"]["Code"]
+        if error_code == "NoSuchKey":
+            logger.error(f"File not found in S3: {s3_key}")
+            logger.error("Run api_ingest.py first to fetch today's data")
+        else:
+            logger.error(f"S3 error reading {s3_key}: {e}")
+        raise
+
+
+def write_csv_to_s3(records: list, s3_key: str) -> None:
+    """
+    Writes a list of dictionaries as CSV directly to S3.
+    Uses in-memory buffer — no local file created.
+    """
+    buffer  = io.StringIO()
+    columns = list(records[0].keys())
+    writer  = csv.DictWriter(buffer, fieldnames=columns)
+    writer.writeheader()
+    writer.writerows(records)
+
+    s3_client.put_object(
+        Bucket      = S3_BUCKET,
+        Key         = s3_key,
+        Body        = buffer.getvalue().encode("utf-8"),
+        ContentType = "text/csv",
+        Metadata    = {
+            "pipeline"        : "india-data-platform",
+            "processed_at"    : datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "record_count"    : str(len(records)),
+            "pipeline_version": "1.0.0",
+        }
+    )
+    logger.info(f"Written to S3: s3://{S3_BUCKET}/{s3_key}")
 
 
 # ============================================================
 # VALIDATION FUNCTIONS
-# Each function checks one specific rule
-# Returns True if valid, False if invalid
 # ============================================================
 
 def is_valid_temperature(temp) -> bool:
-    """
-    Checks if temperature is realistic for India.
-    Anything below -5 or above 55 is clearly wrong data.
-    """
     if temp is None:
         return False
     try:
-        temp = float(temp)
-        return TEMP_MIN <= temp <= TEMP_MAX
+        return TEMP_MIN <= float(temp) <= TEMP_MAX
     except (ValueError, TypeError):
         return False
 
 
 def is_valid_humidity(humidity) -> bool:
-    """
-    Humidity must be between 0 and 100 percent.
-    """
     if humidity is None:
         return False
     try:
-        humidity = float(humidity)
-        return HUMIDITY_MIN <= humidity <= HUMIDITY_MAX
+        return HUMIDITY_MIN <= float(humidity) <= HUMIDITY_MAX
     except (ValueError, TypeError):
         return False
 
 
 # ============================================================
 # TRANSFORMATION FUNCTIONS
-# Each function fixes one specific problem
 # ============================================================
 
 def clean_city_name(city: str) -> str:
-    """
-    Problem 4 fix — standardize city names to uppercase.
-    'mumbai', 'Mumbai', 'MUMBAI' all become 'MUMBAI'
-    """
     if city is None:
         return "UNKNOWN"
     return str(city).strip().upper()
 
 
 def clean_state_name(state: str) -> str:
-    """
-    Standardize state names to uppercase.
-    """
     if state is None:
         return "UNKNOWN"
     return str(state).strip().upper()
 
 
 def clean_rainfall(rainfall) -> float:
-    """
-    Problem 2 fix — replace null rainfall with 0.0
-    Null rainfall means no rain was recorded — 0 is correct.
-    """
     if rainfall is None:
         return 0.0
     try:
-        value = float(rainfall)
-        # Rainfall cannot be negative
-        return max(0.0, value)
+        return max(0.0, float(rainfall))
     except (ValueError, TypeError):
         return 0.0
 
 
 def clean_wind_speed(wind_speed) -> float:
-    """
-    Replace null wind speed with 0.0
-    """
     if wind_speed is None:
         return 0.0
     try:
-        value = float(wind_speed)
-        return max(0.0, value)
+        return max(0.0, float(wind_speed))
     except (ValueError, TypeError):
         return 0.0
 
 
 def parse_fetch_date(fetched_at: str) -> str:
-    """
-    Problem 3 fix — convert plain text date to proper format.
-    Input  : "2026-03-20 01:01:16"  (plain text)
-    Output : "2026-03-20"           (clean date string)
-    In real Spark this becomes a proper DateType column.
-    """
     if fetched_at is None:
         return str(date.today())
     try:
@@ -147,11 +153,6 @@ def parse_fetch_date(fetched_at: str) -> str:
 
 
 def get_temperature_category(temp: float) -> str:
-    """
-    Derives a human readable category from temperature.
-    This is a new column we ADD during transformation.
-    Bronze had raw numbers — Silver adds meaning.
-    """
     if temp >= 40:
         return "EXTREME_HEAT"
     elif temp >= 35:
@@ -164,107 +165,47 @@ def get_temperature_category(temp: float) -> str:
         return "COOL"
 
 
-# ============================================================
-# MAIN TRANSFORMATION LOGIC
-# ============================================================
-
 def transform_record(raw: dict) -> dict | None:
-    """
-    Takes one raw bronze record and returns one clean silver record.
-    Returns None if the record fails critical validation.
-
-    This is the heart of the Silver layer —
-    every single record passes through this function.
-    """
-    city = clean_city_name(raw.get("city"))
+    city  = clean_city_name(raw.get("city"))
     state = clean_state_name(raw.get("state"))
 
-    # --- Critical validations ---
-    # If temperature is invalid we REJECT the record entirely
-    # We cannot guess what the real temperature was
-    temp_raw = raw.get("temperature_c")
-    if not is_valid_temperature(temp_raw):
-        logger.warning(
-            f"REJECTED {city}: invalid temperature '{temp_raw}' "
-            f"— must be between {TEMP_MIN} and {TEMP_MAX}"
-        )
-        return None
-
+    temp_raw     = raw.get("temperature_c")
     humidity_raw = raw.get("humidity_pct")
-    if not is_valid_humidity(humidity_raw):
-        logger.warning(
-            f"REJECTED {city}: invalid humidity '{humidity_raw}' "
-            f"— must be between {HUMIDITY_MIN} and {HUMIDITY_MAX}"
-        )
+
+    if not is_valid_temperature(temp_raw):
+        logger.warning(f"REJECTED {city}: invalid temperature '{temp_raw}'")
         return None
 
-    # --- Safe to transform now ---
-    temp = round(float(temp_raw), 2)
-    humidity = round(float(humidity_raw), 2)
-    rainfall = clean_rainfall(raw.get("rainfall_mm"))
-    wind_speed = clean_wind_speed(raw.get("wind_speed_kmh"))
-    fetch_date = parse_fetch_date(raw.get("fetched_at"))
-    temp_category = get_temperature_category(temp)
+    if not is_valid_humidity(humidity_raw):
+        logger.warning(f"REJECTED {city}: invalid humidity '{humidity_raw}'")
+        return None
 
-    # Build clean silver record
+    temp      = round(float(temp_raw), 2)
+    humidity  = round(float(humidity_raw), 2)
+    rainfall  = clean_rainfall(raw.get("rainfall_mm"))
+    wind      = clean_wind_speed(raw.get("wind_speed_kmh"))
+    fetch_date= parse_fetch_date(raw.get("fetched_at"))
+
     return {
-        "city":              city,
-        "state":             state,
-        "temperature_c":     temp,
-        "humidity_pct":      humidity,
-        "rainfall_mm":       rainfall,
-        "wind_speed_kmh":    wind_speed,
-        "temperature_cat":   temp_category,
-        "fetch_date":        fetch_date,
-        "processed_at":      datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "pipeline_version":  "1.0.0",
-        "source":            "open-meteo.com",
+        "city"            : city,
+        "state"           : state,
+        "temperature_c"   : temp,
+        "humidity_pct"    : humidity,
+        "rainfall_mm"     : rainfall,
+        "wind_speed_kmh"  : wind,
+        "temperature_cat" : get_temperature_category(temp),
+        "fetch_date"      : fetch_date,
+        "processed_at"    : datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "pipeline_version": "1.0.0",
+        "source"          : "open-meteo.com",
     }
 
 
-def read_bronze_file(file_path: str) -> list:
-    """
-    Reads the raw JSON file from bronze layer.
-    """
-    logger.info(f"Reading bronze file: {file_path}")
-    with open(file_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    logger.info(f"Loaded {len(data)} raw records from bronze")
-    return data
-
-
-def save_silver_file(records: list, fetch_date: str) -> str:
-    """
-    Saves clean records to silver layer as CSV.
-    CSV is easier to query with SQL tools like Athena.
-    Folder structure mirrors S3 silver layer partitioning.
-    """
-    folder_path = os.path.join(
-        SILVER_FOLDER,
-        "weather_cleaned",
-        f"fetch_date={fetch_date}"
-    )
-    os.makedirs(folder_path, exist_ok=True)
-
-    file_path = os.path.join(folder_path, "data.csv")
-
-    # Get column names from first record
-    columns = list(records[0].keys())
-
-    with open(file_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=columns)
-        writer.writeheader()
-        writer.writerows(records)
-
-    return file_path
-
+# ============================================================
+# MAIN FUNCTION
+# ============================================================
 
 def run_transformation(process_date: str = None) -> None:
-    """
-    Main function — reads bronze, transforms, saves silver.
-    process_date format: YYYY-MM-DD
-    If not provided, uses today's date.
-    """
     if process_date is None:
         process_date = str(date.today())
 
@@ -273,29 +214,27 @@ def run_transformation(process_date: str = None) -> None:
     logger.info(f"Processing date : {process_date}")
     logger.info("=" * 55)
 
-    # Parse date to build folder path
     dt = datetime.strptime(process_date, "%Y-%m-%d")
 
-    # Build bronze input path
-    bronze_path = os.path.join(
-        BRONZE_FOLDER,
-        "weather",
-        f"year={dt.year}",
-        f"month={dt.month:02d}",
-        f"day={dt.day:02d}",
-        "data.json"
+    # S3 paths
+    bronze_key = (
+        f"bronze/weather/"
+        f"year={dt.year}/"
+        f"month={dt.month:02d}/"
+        f"day={dt.day:02d}/"
+        f"data.json"
+    )
+    silver_key = (
+        f"silver/weather_cleaned/"
+        f"fetch_date={process_date}/"
+        f"data.csv"
     )
 
-    # Check bronze file exists
-    if not os.path.exists(bronze_path):
-        logger.error(f"Bronze file not found: {bronze_path}")
-        logger.error("Run api_ingest.py first to fetch today's data")
-        return
+    # Read from S3 bronze
+    raw_records = read_from_s3(bronze_key)
+    logger.info(f"Loaded {len(raw_records)} raw records from bronze")
 
-    # Read bronze
-    raw_records = read_bronze_file(bronze_path)
-
-    # Transform each record
+    # Transform
     silver_records = []
     rejected_count = 0
 
@@ -307,18 +246,14 @@ def run_transformation(process_date: str = None) -> None:
                 f"  ✅ {clean['city']}: "
                 f"{clean['temperature_c']}°C | "
                 f"{clean['temperature_cat']} | "
-                f"Humidity: {clean['humidity_pct']}% | "
-                f"Rain: {clean['rainfall_mm']}mm"
+                f"Humidity: {clean['humidity_pct']}%"
             )
         else:
             rejected_count += 1
 
-    # Save silver
+    # Write to S3 silver
     if silver_records:
-        file_path = save_silver_file(silver_records, process_date)
-        logger.info(f"Saved {len(silver_records)} clean records to: {file_path}")
-    else:
-        logger.error("No valid records after transformation — nothing saved")
+        write_csv_to_s3(silver_records, silver_key)
 
     # Summary
     logger.info("=" * 55)
@@ -333,10 +268,6 @@ def run_transformation(process_date: str = None) -> None:
     )
     logger.info("=" * 55)
 
-
-# ============================================================
-# ENTRY POINT
-# ============================================================
 
 if __name__ == "__main__":
     run_transformation()
