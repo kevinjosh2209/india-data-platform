@@ -194,7 +194,6 @@ def generate_city_alerts(records: list) -> list:
             "heat_alert"     : heat,
             "cyclone_watch"  : cyclone,
             "overall_risk"   : overall,
-            "fetch_date"     : rec["fetch_date"],
             "processed_at"   : datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         })
     return alerts
@@ -218,7 +217,6 @@ def generate_state_summary(records: list, process_date: str) -> list:
             "min_temp_c"      : round(min(r["temperature_c"] for r in cities), 2),
             "avg_humidity_pct": round(sum(r["humidity_pct"]  for r in cities) / len(cities), 2),
             "total_rain_mm"   : round(sum(r["rainfall_mm"]   for r in cities), 2),
-            "fetch_date"      : process_date,
             "processed_at"    : datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         })
     return summaries
@@ -239,7 +237,6 @@ def generate_daily_rankings(records: list, process_date: str) -> list:
         "temp_rank"   : sorted_temp.index(rec) + 1,
         "humidity_rank": sorted_humidity.index(rec) + 1,
         "rain_rank"   : sorted_rain.index(rec) + 1,
-        "fetch_date"  : process_date,
     } for i, rec in enumerate(sorted_temp)]
 
 
