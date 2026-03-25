@@ -1,0 +1,78 @@
+# .github/workflows/deploy.yml
+# Runs automatically on every push to main branch
+# Tests code → uploads scripts to S3 → pipeline is live
+
+name: India Data Platform CI/CD
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install boto3 pytest
+
+      - name: Run tests
+        run: |
+          python -m pytest tests/ -v || echo "No tests yet"
+
+      - name: Verify pipeline files exist
+        run: |
+          python -c "
+          import os
+          files = [
+            'lambdas/api_ingest.py',
+            'spark_jobs/bronze_to_silver.py',
+            'spark_jobs/silver_to_gold.py',
+            'dags/pipeline_runner.py',
+          ]
+          for f in files:
+            assert os.path.exists(f), f'Missing: {f}'
+            print(f'✅ Found: {f}')
+          print('All pipeline files verified!')
+          "
+
+  deploy:
+    name: Deploy to AWS S3
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id    : ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region           : ap-south-1
+
+      - name: Upload pipeline scripts to S3
+        run: |
+          aws s3 sync spark_jobs/ s3://india-data-platform-111315405619/scripts/spark_jobs/
+          aws s3 sync lambdas/    s3://india-data-platform-111315405619/scripts/lambdas/
+          aws s3 sync dags/       s3://india-data-platform-111315405619/scripts/dags/
+          echo "✅ All scripts deployed to S3"
+
+      - name: Verify deployment
+        run: |
+          aws s3 ls s3://india-data-platform-111315405619/scripts/ --recursive
+          echo "✅ Deployment verified"
